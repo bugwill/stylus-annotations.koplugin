@@ -5,6 +5,7 @@ local Dispatcher = require("dispatcher")
 local Geometry = require("core/geometry")
 local Draw = require("core/draw")
 local PenInput = require("core/pen")
+local Bigme = require("core/bigme")
 local Paged = require("core/mapping/paged")
 local Reflow = require("core/mapping/reflow")
 local StrokeStore = require("core/store")
@@ -53,8 +54,8 @@ end
 local SAVE_DELAY_MS = 800
 local HOLD_MOVE_THRESHOLD_PX = 15
 local LIVE_REFRESH_INTERVAL_MS = 33
-local FAST_LIVE_REFRESH_INTERVAL_MS = 80
-local LIVE_MOVE_THRESHOLD_PX = 2
+local FAST_LIVE_REFRESH_INTERVAL_MS = 16
+local LIVE_MOVE_THRESHOLD_PX = 1
 local LIVE_MOVE_THRESHOLD_PX2 = LIVE_MOVE_THRESHOLD_PX * LIVE_MOVE_THRESHOLD_PX
 local LIVE_MODE_DEFERRED = "deferred"
 local LIVE_MODE_ACCURATE = "live_accurate"
@@ -123,6 +124,7 @@ local StylusAnnotations = InputContainer:extend{
     current_stroke = nil,
     pen_x = 0,
     pen_y = 0,
+    eraser_active = false,
 
     hold_timer = nil,
     hold_start_x = 0,
@@ -138,6 +140,9 @@ local StylusAnnotations = InputContainer:extend{
     live_dirty = nil,
     last_refresh_time = 0,
     pending_save = nil,
+    eraser_refresh_timer = nil,
+    bigme_start_timer = nil,
+    bigme_poll_timer = nil,
 }
 
 function StylusAnnotations:init()
@@ -172,6 +177,61 @@ end
 function StylusAnnotations:onReaderReady()
     self:loadStrokes()
     self.ui:handleEvent(Event:new("UpdatePos"))
+    if Device:isAndroid() then
+        self.bigme_start_timer = function()
+            self.bigme_start_timer = nil
+            self:startBigmeInput()
+        end
+        UIManager:nextTick(self.bigme_start_timer)
+    end
+end
+
+function StylusAnnotations:startBigmeInput()
+    if self.bigme_poll_timer then return end
+    if not Bigme.probe() then
+        logger.info("StylusAnnotations: Bigme handwriting API not available; using KOReader input")
+        return
+    end
+
+    local started, width, height = Bigme.start()
+    if not started then
+        logger.warn("StylusAnnotations: Bigme input bridge unavailable:", width)
+        return
+    end
+    self.pen_input:setBigmeActive(true, width, height)
+    logger.info("StylusAnnotations: using Bigme input bridge, view =", width, height)
+
+    self.bigme_poll_timer = function()
+        if not Bigme.bridge then
+            self.bigme_poll_timer = nil
+            return
+        end
+        local batch = Bigme.drain()
+        if batch and batch ~= "" then
+            for event in batch:gmatch("[^;]+") do
+                local event_type, x, y, pressure, tool_type = event:match(
+                    "^(%-?%d+),(%-?%d+),(%-?%d+),(%-?%d+),(%-?%d+),%-?%d+$")
+                if event_type then
+                    self.pen_input:onBigmeEvent(
+                        tonumber(event_type), tonumber(x), tonumber(y),
+                        tonumber(pressure), tonumber(tool_type))
+                end
+            end
+        end
+        if self.bigme_poll_timer then
+            UIManager:scheduleIn(0.008, self.bigme_poll_timer)
+        end
+    end
+    UIManager:scheduleIn(0.008, self.bigme_poll_timer)
+end
+
+function StylusAnnotations:stopBigmeInput()
+    if self.bigme_poll_timer then
+        UIManager:unschedule(self.bigme_poll_timer)
+        self.bigme_poll_timer = nil
+    end
+    self.pen_input:setBigmeActive(false)
+    Bigme.close()
 end
 
 function StylusAnnotations:onCloseDocument()
@@ -180,6 +240,18 @@ function StylusAnnotations:onCloseDocument()
         self.pending_save = nil
     end
     self:cancelHoldTimer()
+    if self.bigme_start_timer then
+        UIManager:unschedule(self.bigme_start_timer)
+        self.bigme_start_timer = nil
+    end
+    if self.eraser_refresh_timer then
+        UIManager:unschedule(self.eraser_refresh_timer)
+        self.eraser_refresh_timer = nil
+    end
+    self:stopBigmeInput()
+    if self.current_stroke then
+        self:endStroke()
+    end
     self.current_stroke = nil
     self:cancelLive()
     self.pen_input:unregister()
@@ -200,7 +272,11 @@ end
 
 function StylusAnnotations:updateLiveMode(enabled)
     if enabled then
-        self.live_mode = Device:hasEinkScreen() and LIVE_MODE_FAST or LIVE_MODE_ACCURATE
+        -- Some Android e-ink readers (including Bigme) report themselves as
+        -- non-e-ink to KOReader. Use the incremental path there as well, so a
+        -- growing stroke is not repeatedly restored and repainted in full.
+        self.live_mode = (Device:hasEinkScreen() or Device:isAndroid())
+            and LIVE_MODE_FAST or LIVE_MODE_ACCURATE
     else
         self.live_mode = LIVE_MODE_DEFERRED
     end
@@ -331,7 +407,8 @@ function StylusAnnotations:startStroke(x, y)
         self:takeLiveSnapshot()
         if self.live_mode == LIVE_MODE_FAST then
             local sw = self:getStrokeScreenWidth(stroke)
-            Draw.stampDisc(Screen.bb, x, y, sw / 2, Blitbuffer.COLOR_BLACK)
+            Draw.stampDisc(Screen.bb, x, y, sw / 2,
+                Draw.getRenderColor(stroke, self.ui.highlight))
         end
     end
 
@@ -351,7 +428,8 @@ function StylusAnnotations:addStrokePoint(x, y)
     local seg_w = math.abs(x - self.pen_x) + 2 * pad
     local seg_h = math.abs(y - self.pen_y) + 2 * pad
     if self.live_mode == LIVE_MODE_FAST then
-        self:stampLiveSegment(stroke, x, y, sw)
+        self:stampLiveSegment(stroke, x, y, sw,
+            Draw.getRenderColor(stroke, self.ui.highlight))
     end
     self:accumulateSegment(seg_x, seg_y, seg_w, seg_h)
 
@@ -364,12 +442,12 @@ function StylusAnnotations:addStrokePoint(x, y)
     end
 end
 
-function StylusAnnotations:stampLiveSegment(stroke, x, y, sw)
+function StylusAnnotations:stampLiveSegment(stroke, x, y, sw, color)
     local t0 = time.now()
     Draw.stampPath(Screen.bb, {
         { x = self.pen_x, y = self.pen_y },
         { x = x, y = y },
-    }, 0, 0, sw / 2, Blitbuffer.COLOR_BLACK)
+    }, 0, 0, sw / 2, color)
     if self.stroke_timing then
         self.stroke_timing.paint_ms = self.stroke_timing.paint_ms
             + time.to_ms(time.now() - t0)
@@ -427,7 +505,7 @@ function StylusAnnotations:onStrokeCancel()
     self.dirty_region = nil
     self.stroke_timing = nil
     self:cancelLive()
-    UIManager:setDirty(self.view, "partial")
+    UIManager:setDirty(self.view.dialog, "partial")
 end
 
 function StylusAnnotations:endStroke()
@@ -554,13 +632,13 @@ function StylusAnnotations:refreshRegion(region)
     if region then
         local rx, ry, rw, rh = clampToScreen(region.x, region.y, region.w, region.h)
         if rx then
-            UIManager:setDirty(self.view, function()
+            UIManager:setDirty(self.view.dialog, function()
                 return "partial", Geom:new{x = rx, y = ry, w = rw, h = rh}
             end)
             return
         end
     end
-    UIManager:setDirty(self.view, "partial")
+    UIManager:setDirty(self.view.dialog, "partial")
 end
 
 function StylusAnnotations:paintTo(bb, x, y)
@@ -743,7 +821,7 @@ end
 function StylusAnnotations:setStrokeAttribute(strokes, attribute, value)
     self.store:setAttribute(strokes, attribute, value)
     self:scheduleSave()
-    UIManager:setDirty(self.view, "partial")
+    UIManager:setDirty(self.view.dialog, "partial")
 end
 
 function StylusAnnotations:setStrokeColor(strokes, color)
@@ -901,6 +979,19 @@ function StylusAnnotations:addToMainMenu(menu_items)
                 end,
             },
             {
+                text_func = function()
+                    return self.bigme_poll_timer and _("Bigme input: on")
+                        or _("Try Bigme input (experimental)")
+                end,
+                callback = function()
+                    if self.bigme_poll_timer then
+                        self:stopBigmeInput()
+                    else
+                        self:startBigmeInput()
+                    end
+                end,
+            },
+            {
                 text = _("Delete strokes on the current page"),
                 callback = function()
                     self:deleteAllStrokesOnPage()
@@ -929,17 +1020,26 @@ end
 function StylusAnnotations:deleteStrokes(strokes, notify)
     local removed = self.store:remove(strokes)
     self:scheduleSave()
-    UIManager:setDirty(self.view, "partial")
+    UIManager:setDirty(self.view.dialog, "partial")
     if notify ~= false then
         self:notifyStrokeDeleted(removed)
     end
 end
 
-function StylusAnnotations:eraseStrokeAt(x, y)
-    local removed = self.store:eraseAt(x, y)
+function StylusAnnotations:scheduleEraserRefresh()
+    if self.eraser_refresh_timer then return end
+    self.eraser_refresh_timer = function()
+        self.eraser_refresh_timer = nil
+        UIManager:setDirty(self.view.dialog, "partial")
+    end
+    UIManager:scheduleIn(0.033, self.eraser_refresh_timer)
+end
+
+function StylusAnnotations:eraseStrokesAlong(x1, y1, x2, y2)
+    local removed = self.store:eraseAlong(x1, y1, x2, y2)
     if removed > 0 then
         self:scheduleSave()
-        UIManager:setDirty(self.view, "partial")
+        self:scheduleEraserRefresh()
     end
     return removed
 end
@@ -971,7 +1071,7 @@ function StylusAnnotations:confirmDeleteStrokes(text, count, remove)
         ok_callback = function()
             local removed = remove()
             self:scheduleSave()
-            UIManager:setDirty(self.view, "partial")
+            UIManager:setDirty(self.view.dialog, "partial")
             self:notifyStrokeDeleted(removed)
         end,
     })

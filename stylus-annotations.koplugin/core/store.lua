@@ -4,6 +4,7 @@ local lfs = require("libs/libkoreader-lfs")
 local StrokeStore = {}
 
 local HIT_TEST_THRESHOLD_PX = 25
+local ERASER_RADIUS_PX = 36
 local MIN_SPACING = 2.0
 
 StrokeStore.STORAGE_VERSION = 1
@@ -13,6 +14,51 @@ local NOOP_LOGGER = {
     warn = function() end,
     err = function() end,
 }
+
+local function pointSegmentDistanceSq(px, py, x1, y1, x2, y2)
+    local dx, dy = x2 - x1, y2 - y1
+    local len_sq = dx * dx + dy * dy
+    local t = 0
+    if len_sq > 0 then
+        t = ((px - x1) * dx + (py - y1) * dy) / len_sq
+    end
+    t = math.max(0, math.min(1, t))
+    local ex, ey = px - (x1 + t * dx), py - (y1 + t * dy)
+    return ex * ex + ey * ey
+end
+
+local function orientation(ax, ay, bx, by, cx, cy)
+    local cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+    if math.abs(cross) < 0.000001 then return 0 end
+    return cross > 0 and 1 or -1
+end
+
+local function onSegment(px, py, x1, y1, x2, y2)
+    local epsilon = 0.000001
+    return px >= math.min(x1, x2) - epsilon and px <= math.max(x1, x2) + epsilon
+        and py >= math.min(y1, y2) - epsilon and py <= math.max(y1, y2) + epsilon
+end
+
+local function segmentsIntersect(ax, ay, bx, by, cx, cy, dx, dy)
+    local o1 = orientation(ax, ay, bx, by, cx, cy)
+    local o2 = orientation(ax, ay, bx, by, dx, dy)
+    local o3 = orientation(cx, cy, dx, dy, ax, ay)
+    local o4 = orientation(cx, cy, dx, dy, bx, by)
+    if o1 * o2 < 0 and o3 * o4 < 0 then return true end
+    return (o1 == 0 and onSegment(cx, cy, ax, ay, bx, by))
+        or (o2 == 0 and onSegment(dx, dy, ax, ay, bx, by))
+        or (o3 == 0 and onSegment(ax, ay, cx, cy, dx, dy))
+        or (o4 == 0 and onSegment(bx, by, cx, cy, dx, dy))
+end
+
+local function segmentDistanceSq(ax, ay, bx, by, cx, cy, dx, dy)
+    if segmentsIntersect(ax, ay, bx, by, cx, cy, dx, dy) then return 0 end
+    return math.min(
+        pointSegmentDistanceSq(ax, ay, cx, cy, dx, dy),
+        pointSegmentDistanceSq(bx, by, cx, cy, dx, dy),
+        pointSegmentDistanceSq(cx, cy, ax, ay, bx, by),
+        pointSegmentDistanceSq(dx, dy, ax, ay, bx, by))
+end
 
 function StrokeStore:new(mapper, logger)
     local o = {
@@ -114,6 +160,43 @@ function StrokeStore:eraseAt(x, y)
     local stroke = self:findStrokeAt(x, y)
     if not stroke then return 0 end
     return self:remove({ stroke })
+end
+
+function StrokeStore:eraseAlong(x1, y1, x2, y2)
+    -- Reverse-tip erasers report the tip center; use a radius closer to the
+    -- physical contact patch on high-DPI e-ink screens.
+    local threshold = ERASER_RADIUS_PX
+    local threshold_sq = threshold * threshold
+    local min_x, max_x = math.min(x1, x2) - threshold, math.max(x1, x2) + threshold
+    local min_y, max_y = math.min(y1, y2) - threshold, math.max(y1, y2) + threshold
+    local hits = {}
+
+    for _, stroke in ipairs(self.strokes) do
+        if not self.mapper:strokeCulled(stroke) then
+            local spts = self.mapper:strokeToScreenPts(stroke)
+            local sx0, sy0, sx1, sy1
+            if spts then sx0, sy0, sx1, sy1 = Geometry.screenBounds(spts) end
+            local pad = math.max(1, (stroke.width or 1) * (stroke.zoom or 1) / 2)
+            if sx0 and sx0 - pad <= max_x and sx1 + pad >= min_x
+                and sy0 - pad <= max_y and sy1 + pad >= min_y then
+                local hit = false
+                if #spts == 2 then
+                    hit = pointSegmentDistanceSq(spts[1], spts[2], x1, y1, x2, y2) <= threshold_sq
+                else
+                    for i = 1, #spts - 3, 2 do
+                        if segmentDistanceSq(x1, y1, x2, y2,
+                            spts[i], spts[i + 1], spts[i + 2], spts[i + 3]) <= threshold_sq then
+                            hit = true
+                            break
+                        end
+                    end
+                end
+                if hit then hits[#hits + 1] = stroke end
+            end
+        end
+    end
+
+    return #hits > 0 and self:remove(hits) or 0
 end
 
 function StrokeStore:strokesIntersectMid(a, b)

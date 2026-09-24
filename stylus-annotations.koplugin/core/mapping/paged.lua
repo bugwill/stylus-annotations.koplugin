@@ -9,6 +9,7 @@ end
 
 function Paged:initStroke(stroke, x, y)
     local pos = self.view:screenToPageTransform({ x = x, y = y })
+    if not pos then return false end
     stroke.page = pos.page
     stroke.zoom = pos.zoom or 1
     stroke.points = { pos.x, pos.y }
@@ -17,6 +18,7 @@ end
 
 function Paged:addPoint(stroke, x, y)
     local pos = self.view:screenToPageTransform({ x = x, y = y })
+    if not pos then return false end
     if pos.page ~= stroke.page then return end
     local pts = stroke.points
     local m = #pts

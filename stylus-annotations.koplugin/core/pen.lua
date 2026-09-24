@@ -23,6 +23,14 @@ function PenInput:new(plugin)
         pen_lift_y = 0,
         lift_match_radius = 20,
         eraser_active = false,
+        eraser_x = nil,
+        eraser_y = nil,
+        bigme_active = false,
+        bigme_pointer_tool = nil,
+        bigme_width = nil,
+        bigme_height = nil,
+        bigme_logged_pen = false,
+        bigme_eraser_removed = 0,
     }
     return setmetatable(o, { __index = PenInput })
 end
@@ -42,6 +50,16 @@ end
 
 function PenInput:isPenActive()
     return self.pen_active
+end
+
+function PenInput:setBigmeActive(active, width, height)
+    self.bigme_active = active
+    self.bigme_width = width
+    self.bigme_height = height
+    self.bigme_pointer_tool = nil
+    self.bigme_logged_pen = false
+    self.pen_active = false
+    self:resetEraserState()
 end
 
 function PenInput:installGestureHook()
@@ -124,6 +142,12 @@ function PenInput:unregisterPlatformInput()
     end
 end
 
+function PenInput:resetEraserState()
+    self.eraser_active = false
+    self.eraser_x, self.eraser_y = nil, nil
+    self.plugin.eraser_active = false
+end
+
 function PenInput:onStylusEvent(input, slot)
     local plugin = self.plugin
     local x, y = self:transformCoordinates(slot.x or 0, slot.y or 0)
@@ -132,15 +156,33 @@ function PenInput:onStylusEvent(input, slot)
     logger.dbg("PenInput:onStylusEvent",
         "slot=", slot.slot, "tool=", slot.tool, "id=", slot.id,
         "raw=", slot.x, slot.y, "pos=", x, y,
-        "eraser=", self.eraser_active)
+        "eraser=", self.eraser_active,
+        "input_eraser=", input.stylus_eraser_active)
 
     if slot.tool == TOOL_TYPE_FINGER
         and input.pen_slot and slot.slot == input.pen_slot then
+        if not (slot.id and slot.id >= 0) then
+            self:resetEraserState()
+        end
         return true
     end
 
     if not self:isPenTool(slot) then
         return false
+    end
+
+    if self.bigme_active then
+        -- Bigme's framework callback supplies the authoritative coordinates and
+        -- tool (including the reverse-tip eraser). Keep the evdev copy out of
+        -- KOReader's gesture detector without processing it a second time.
+        if not plugin:isEnabled() then
+            return false
+        end
+        if plugin:isOverlayActive() then
+            if not (slot.id and slot.id >= 0) then self.pen_active = false end
+            return self.pen_active
+        end
+        return true
     end
 
     if plugin:isOverlayActive() then
@@ -153,9 +195,13 @@ function PenInput:onStylusEvent(input, slot)
         return false
     end
 
-    if slot.tool == TOOL_TYPE_ERASER then
+    local eraser_tool = slot.tool == TOOL_TYPE_ERASER
+        or (slot.tool == TOOL_TYPE_PEN and input.stylus_eraser_active)
+    if eraser_tool then
         return self:onEraserEvent(x, y, slot.id or -1)
     end
+
+    self:resetEraserState()
 
     if slot.id and slot.id >= 0 then
         if not plugin:isEnabled() then return false end
@@ -187,15 +233,103 @@ function PenInput:onStylusEvent(input, slot)
     return ret
 end
 
+function PenInput:onBigmeEvent(event_type, x, y, pressure, tool_type)
+    local plugin = self.plugin
+    local ACTION_DOWN, ACTION_MOVE, ACTION_UP, ACTION_LEAVE = 1, 2, 3, 4
+    local TOOL_PEN, TOOL_ERASER, TOOL_FINGER = 0, 1, 2
+    if tool_type == TOOL_FINGER then return end
+
+    local screen = Device.screen
+    if self.bigme_width and self.bigme_width > 0 then
+        x = x * screen:getWidth() / self.bigme_width
+    end
+    if self.bigme_height and self.bigme_height > 0 then
+        y = y * screen:getHeight() / self.bigme_height
+    end
+
+    if event_type == ACTION_UP or event_type == ACTION_LEAVE then
+        if self.bigme_pointer_tool == TOOL_ERASER then
+            logger.info("PenInput: Bigme eraser contact ended; strokes removed =",
+                self.bigme_eraser_removed)
+            self:resetEraserState()
+        elseif self.bigme_pointer_tool == TOOL_PEN then
+            local was_active = self.pen_active
+            self.pen_active = false
+            if plugin.current_stroke then
+                plugin:endStroke()
+                if was_active then
+                    self.pen_lift_x, self.pen_lift_y = x, y
+                    self.pen_lift_pending = true
+                end
+            end
+        end
+        self.bigme_pointer_tool = nil
+        return
+    end
+    if event_type ~= ACTION_DOWN and event_type ~= ACTION_MOVE then return end
+
+    if plugin:isOverlayActive() or not plugin:isEnabled() then
+        if event_type == ACTION_DOWN then
+            self.bigme_pointer_tool = nil
+            self.pen_active = false
+            self:resetEraserState()
+        end
+        return
+    end
+
+    if tool_type == TOOL_ERASER then
+        if self.bigme_pointer_tool ~= TOOL_ERASER and event_type ~= ACTION_DOWN then
+            return
+        end
+        if event_type == ACTION_DOWN then
+            self.bigme_eraser_removed = 0
+            logger.info("PenInput: Bigme eraser event received at", x, y,
+                "visible strokes =", #plugin.store.strokes)
+        end
+        self.bigme_pointer_tool = TOOL_ERASER
+        self.pen_active = false
+        self:onEraserEvent(x, y, 1)
+        return
+    end
+    if tool_type ~= TOOL_PEN then return end
+    if self.bigme_pointer_tool ~= TOOL_PEN and event_type ~= ACTION_DOWN then return end
+
+    if event_type == ACTION_DOWN and not self.bigme_logged_pen then
+        self.bigme_logged_pen = true
+        logger.info("PenInput: Bigme pen event received at", x, y)
+    end
+    self.bigme_pointer_tool = TOOL_PEN
+    self:resetEraserState()
+    self.pen_lift_pending = false
+    self.pen_active = true
+    if event_type == ACTION_DOWN or not plugin.current_stroke then
+        plugin:startStroke(x, y)
+    else
+        plugin:addStrokePoint(x, y)
+    end
+end
+
 function PenInput:onEraserEvent(x, y, id)
     local plugin = self.plugin
-    if plugin:isOverlayActive() then return false end
+    if plugin:isOverlayActive() then
+        self:resetEraserState()
+        return false
+    end
     if id >= 0 then
+        if plugin.current_stroke then
+            self.pen_active = false
+            plugin:endStroke()
+        end
+        local from_x = self.eraser_active and self.eraser_x or x
+        local from_y = self.eraser_active and self.eraser_y or y
         self.eraser_active = true
-        plugin:eraseStrokeAt(x, y)
+        plugin.eraser_active = true
+        self.eraser_x, self.eraser_y = x, y
+        self.bigme_eraser_removed = self.bigme_eraser_removed
+            + plugin:eraseStrokesAlong(from_x, from_y, x, y)
         return true
     else
-        self.eraser_active = false
+        self:resetEraserState()
         return true
     end
 end

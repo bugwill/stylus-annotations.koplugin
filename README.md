@@ -16,10 +16,16 @@ You'll find the "Stylus annotations" settings in the second tab of the top menu,
 ## Features
 
 - **Enable drawing:** when on, the plugin captures pen strokes. When off, you can use the pen as usual, as if the plugin weren't installed.
-- **Live refresh:** off by default on e-ink devices, on by default elsewhere. Turn it on if your device is powerful enough to render strokes while you draw (regular Android phones, for example). When off, the stroke appears only after you finish drawing it.
+- **Live refresh:** on by default. E-ink and Android devices use an incremental fast path; other devices use a more accurate live redraw. Turn it off if your device is too slow to render strokes while you draw. When off, the stroke appears only after you finish drawing it.
 - **Width and color:** change these options for all new strokes, or modify existing ones.
 - **Selection and chain selection:** tap a stroke with your finger, or long-press with your stylus, to open the stroke's options. Long-press with your finger instead to select the whole chain of connected strokes and apply the options to all of them.
 - **Deleting strokes:** remove all strokes on a page or in the whole document at once, so you don't have to delete them one by one.
+- **Stylus eraser:** when KOReader reports the pen as an eraser, sweep the tip over annotations to remove the strokes it crosses.
+- **Bigme B1051 input:** on Bigme firmware that exposes its handwriting service, the plugin reads the OEM pen and reverse-tip eraser events while keeping annotation rendering and storage in KOReader. Other devices continue to use KOReader's regular stylus input path.
+
+For Bigme, install the complete plugin folder so the bundled `core/bigme/BigmeInputBridge.dex` is present. The plugin falls back to regular KOReader input if the Bigme service cannot be started.
+
+The Bigme bridge bundles [LSPosed HiddenApiBypass 6.1](https://github.com/LSPosed/AndroidHiddenApiBypass) under Apache-2.0 to access Bigme's blocked `com.xrz` framework API. See `core/bigme/LICENSE-hiddenapibypass.txt`.
 
 ## Disclaimer
 
@@ -29,4 +35,3 @@ Still under development. The code is AI-assisted, like, a lot, so beware of the 
 - Some kind of bookmarks for pages with strokes
 - Write strokes into PDF
 - Stylus pressure?
-- Eraser?
