@@ -1,6 +1,7 @@
 package org.koreader.bigme;
 
 import android.app.Activity;
+import android.app.Application;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapShader;
@@ -14,6 +15,7 @@ import android.graphics.PixelFormat;
 import android.graphics.PorterDuff;
 import android.graphics.Rect;
 import android.graphics.Shader;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Process;
@@ -144,6 +146,14 @@ public final class BigmeInputBridge {
     /** True while normal commits are suspended for handwriting (guarded by renderLock). */
     private boolean normalCommitSuspended;
     private long lastInkCommitMs;
+    /**
+     * False while KOReader's activity is paused. The Bigme service keeps
+     * calling our listener for pen input in other apps (launcher, notes);
+     * those events must never reach KOReader's queue.
+     */
+    private volatile boolean appForeground = true;
+    private Activity boundActivity;
+    private Application.ActivityLifecycleCallbacks lifecycleCallbacks;
 
     public BigmeInputBridge() {
     }
@@ -349,6 +359,7 @@ public final class BigmeInputBridge {
             }
 
             initializeDirectInk();
+            registerLifecycle(activity);
 
             Object version = callOptional("getVersion", new Class<?>[0]);
             Log.i(TAG, "Bigme input connected; view=" + width + "x" + height
@@ -1035,6 +1046,81 @@ public final class BigmeInputBridge {
         lastInkCommitMs = android.os.SystemClock.uptimeMillis();
     }
 
+    private void registerLifecycle(final Activity activity) {
+        if (lifecycleCallbacks != null) return;
+        boundActivity = activity;
+        appForeground = true;
+        lifecycleCallbacks = new Application.ActivityLifecycleCallbacks() {
+            @Override
+            public void onActivityResumed(Activity a) {
+                if (a == boundActivity) setForeground(true);
+            }
+
+            @Override
+            public void onActivityPaused(Activity a) {
+                if (a == boundActivity) setForeground(false);
+            }
+
+            @Override
+            public void onActivityCreated(Activity a, Bundle state) {
+            }
+
+            @Override
+            public void onActivityStarted(Activity a) {
+            }
+
+            @Override
+            public void onActivityStopped(Activity a) {
+            }
+
+            @Override
+            public void onActivitySaveInstanceState(Activity a, Bundle state) {
+            }
+
+            @Override
+            public void onActivityDestroyed(Activity a) {
+            }
+        };
+        activity.getApplication().registerActivityLifecycleCallbacks(lifecycleCallbacks);
+    }
+
+    private void unregisterLifecycle() {
+        if (lifecycleCallbacks != null && boundActivity != null) {
+            boundActivity.getApplication()
+                    .unregisterActivityLifecycleCallbacks(lifecycleCallbacks);
+        }
+        lifecycleCallbacks = null;
+        boundActivity = null;
+        appForeground = true;
+    }
+
+    /**
+     * Stop accepting pen input while KOReader is in the background. Pending
+     * events are dropped and a synthetic LEAVE closes any stroke or eraser
+     * contact Lua still holds open, so nothing drawn in another app is
+     * replayed into the document on resume.
+     */
+    private synchronized void setForeground(boolean foreground) {
+        if (appForeground == foreground) return;
+        appForeground = foreground;
+        Log.i(TAG, "KOReader " + (foreground ? "resumed" : "paused")
+                + "; pen input " + (foreground ? "enabled" : "disabled"));
+        if (!foreground) {
+            events.clear();
+            synchronized (directInkLock) {
+                directInkEvents.clear();
+            }
+            if (client != null) {
+                events.addLast(new PenEvent(ACTION_LEAVE, 0, 0, 0, TOOL_PEN, 0L,
+                        System.nanoTime()));
+            }
+            forceCommitNormal();
+        }
+        if (client != null) {
+            callOptional("setInputEnabled", new Class<?>[] { boolean.class }, foreground);
+        }
+    }
+
     public boolean isDirectInkAvailable() {
         return directInkAvailable;
     }
@@ -1050,7 +1136,7 @@ public final class BigmeInputBridge {
 
     private synchronized void enqueue(
             int eventType, int x, int y, int pressure, int toolType, long eventTimeNs) {
-        if (client == null) return;
+        if (client == null || !appForeground) return;
         if (eventType == 1 && loggedToolTypes.add(toolType)) {
             Log.i(TAG, "Bigme pen tool detected: toolType=" + toolType
                     + " (vendor documents PEN=0, RUBBER=1, FINGER=2)");
@@ -1191,6 +1277,7 @@ public final class BigmeInputBridge {
     }
 
     private synchronized void closeOnMainThread() {
+        unregisterLifecycle();
         events.clear();
         loggedToolTypes.clear();
         releaseClient();
