@@ -60,6 +60,16 @@ local LIVE_MOVE_THRESHOLD_PX2 = LIVE_MOVE_THRESHOLD_PX * LIVE_MOVE_THRESHOLD_PX
 local LIVE_MODE_DEFERRED = "deferred"
 local LIVE_MODE_ACCURATE = "live_accurate"
 local LIVE_MODE_FAST = "live_fast"
+-- Draw live ink through Bigme's handwriting canvas (Base.apk's path): the
+-- bridge's worker thread paints and commits with the 1029 waveform, and
+-- KOReader repaints the finished strokes once the pen has been idle for
+-- BIGME_FINALIZE_DELAY_S. Set to false to fall back to KOReader rendering.
+local USE_BIGME_OEM_CANVAS_LIVE_INK = true
+-- HandwritingManager commits the normal surface ~100 ms after the last ink.
+local BIGME_FINALIZE_DELAY_S = 0.15
+-- Lua only consumes stroke data when the OEM canvas draws the preview.
+local BIGME_POLL_INTERVAL_S = 0.008
+local BIGME_DIRECT_INK_POLL_INTERVAL_S = 0.016
 local DEFAULT_HOLD_INTERVAL_MS = 500
 
 local MIN_STROKE_WIDTH = 1
@@ -143,6 +153,13 @@ local StylusAnnotations = InputContainer:extend{
     eraser_refresh_timer = nil,
     bigme_start_timer = nil,
     bigme_poll_timer = nil,
+    bigme_direct_ink = false,
+    bigme_ink_style_key = nil,
+    bigme_writable_spec = nil,
+    bigme_mirror_hooks = nil,
+    bigme_finalize_timer = nil,
+    bigme_pending_region = nil,
+    bigme_restart_timer = nil,
 }
 
 function StylusAnnotations:init()
@@ -176,14 +193,79 @@ end
 
 function StylusAnnotations:onReaderReady()
     self:loadStrokes()
+    -- Like Base.apk's generateBoxAnnot: turn ink annotations found in the PDF
+    -- (our own copies and other apps' ink) into strokes, then bring the PDF's
+    -- copies in line with our strokes. Normally everything already matches
+    -- (nothing imported, nothing written).
+    self:importPdfInkAnnotations()
+    self:schedulePdfStylusSync(0)
     self.ui:handleEvent(Event:new("UpdatePos"))
     if Device:isAndroid() then
+        if self.bigme_start_timer then
+            UIManager:unschedule(self.bigme_start_timer)
+        end
         self.bigme_start_timer = function()
             self.bigme_start_timer = nil
             self:startBigmeInput()
         end
         UIManager:nextTick(self.bigme_start_timer)
     end
+end
+
+function StylusAnnotations:syncBigmeInkStyle(force)
+    if not self.bigme_direct_ink then return false end
+    -- Strokes are rendered at width * zoom (set by mapper:initStroke). The
+    -- OEM worker draws before Lua sees the pen-down, so use the zoom of the
+    -- visible page now; otherwise the preview is thinner than the final ink.
+    local pages = self.mapper:getVisiblePages()
+    local zoom = pages and pages[1] and self.mapper:getZoom(pages[1]) or 1
+    local stroke = { width = self.width, color = self.color, alpha = 1.0, zoom = zoom }
+    -- Send the real stroke color; the bridge turns non-black colors into the
+    -- dither pattern the bilevel handwriting layer can show (as Base.apk
+    -- does), so the ink does not change shade when KOReader repaints it.
+    local color = Draw.getRenderColor(stroke, self.ui.highlight):getColorRGB32()
+    local argb = string.format("%02X%02X%02X%02X", 0xFF, color.r, color.g, color.b)
+    local width = self:getStrokeScreenWidth(stroke)
+    local sx, sy = 1, 1
+    local view_width = self.pen_input and self.pen_input.bigme_width
+    local view_height = self.pen_input and self.pen_input.bigme_height
+    if view_width and Screen:getWidth() > 0 then
+        sx = view_width / Screen:getWidth()
+    end
+    if view_height and Screen:getHeight() > 0 then
+        sy = view_height / Screen:getHeight()
+    end
+    width = width * sx
+    local enabled = self.live_mode == LIVE_MODE_FAST
+        and self:isEnabled() and not self:isOverlayActive()
+    local key = table.concat({ enabled and "1" or "0", string.format("%.3f", width), argb }, ",")
+    if force or key ~= self.bigme_ink_style_key then
+        if not Bigme.setDirectInkStyle(enabled, width, argb) then
+            self.bigme_direct_ink = false
+            self.bigme_ink_style_key = nil
+            logger.warn("StylusAnnotations: could not configure Bigme worker renderer")
+            return false
+        end
+        self.bigme_ink_style_key = key
+    end
+
+    local rects = self.mapper:getWritableRects()
+    local spec = ""
+    if rects then
+        local parts = {}
+        for i, r in ipairs(rects) do
+            parts[i] = string.format("%d,%d,%d,%d",
+                math.floor(r.x * sx), math.floor(r.y * sy),
+                math.ceil((r.x + r.w) * sx), math.ceil((r.y + r.h) * sy))
+        end
+        -- No page on screen: nothing is writable.
+        spec = #parts > 0 and table.concat(parts, ";") or "0,0,0,0"
+    end
+    if force or spec ~= self.bigme_writable_spec then
+        Bigme.setWritableRects(spec)
+        self.bigme_writable_spec = spec
+    end
+    return true
 end
 
 function StylusAnnotations:startBigmeInput()
@@ -199,39 +281,216 @@ function StylusAnnotations:startBigmeInput()
         return
     end
     self.pen_input:setBigmeActive(true, width, height)
+    local oem_canvas_available = Bigme.hasDirectInk()
+    self.bigme_direct_ink = USE_BIGME_OEM_CANVAS_LIVE_INK and oem_canvas_available
+    self.bigme_ink_style_key = nil
     logger.info("StylusAnnotations: using Bigme input bridge, view =", width, height)
+    logger.info("StylusAnnotations: Bigme OEM Canvas available =", oem_canvas_available,
+        "live ink enabled =", self.bigme_direct_ink)
+    if self.bigme_direct_ink then
+        self:startBigmeScreenMirror()
+        self:syncBigmeInkStyle(true)
+    end
 
     self.bigme_poll_timer = function()
         if not Bigme.bridge then
             self.bigme_poll_timer = nil
             return
         end
-        local batch = Bigme.drain()
+        -- Update the preview state before handling points, so an overlay
+        -- that just opened stops OEM ink as early as possible.
+        if self.bigme_direct_ink then
+            self:syncBigmeInkStyle()
+        end
+        local batch, direct_ink_available = Bigme.drain()
         if batch and batch ~= "" then
+            -- Coalescing moves saves Lua rendering work, but with the OEM
+            -- preview Lua only records points: keep them all, so the final
+            -- repaint matches the ink already on screen.
+            local coalesce_moves = not self.bigme_direct_ink
+            local pending_move
+            local function dispatchBigmeEvent(event)
+                self.pen_input:onBigmeEvent(
+                    event[1], event[2], event[3], event[4], event[5])
+            end
             for event in batch:gmatch("[^;]+") do
                 local event_type, x, y, pressure, tool_type = event:match(
                     "^(%-?%d+),(%-?%d+),(%-?%d+),(%-?%d+),(%-?%d+),%-?%d+$")
                 if event_type then
-                    self.pen_input:onBigmeEvent(
+                    local decoded = {
                         tonumber(event_type), tonumber(x), tonumber(y),
-                        tonumber(pressure), tonumber(tool_type))
+                        tonumber(pressure), tonumber(tool_type),
+                    }
+                    if decoded[1] == 2 and coalesce_moves then
+                        if pending_move and pending_move[5] ~= decoded[5] then
+                            dispatchBigmeEvent(pending_move)
+                        end
+                        pending_move = decoded
+                    else
+                        if pending_move then
+                            dispatchBigmeEvent(pending_move)
+                            pending_move = nil
+                        end
+                        dispatchBigmeEvent(decoded)
+                    end
                 end
+            end
+            if pending_move then dispatchBigmeEvent(pending_move) end
+        end
+        if self.bigme_direct_ink and not direct_ink_available then
+            self.bigme_direct_ink = false
+            logger.warn("StylusAnnotations: Bigme OEM Canvas failed; falling back to KOReader live refresh")
+            self:finalizeBigmeInk()
+            if self.current_stroke and self.dirty_region then
+                self:refreshRegion(self.dirty_region)
             end
         end
         if self.bigme_poll_timer then
-            UIManager:scheduleIn(0.008, self.bigme_poll_timer)
+            UIManager:scheduleIn(self:bigmePollInterval(), self.bigme_poll_timer)
         end
     end
-    UIManager:scheduleIn(0.008, self.bigme_poll_timer)
+    UIManager:scheduleIn(self:bigmePollInterval(), self.bigme_poll_timer)
+end
+
+function StylusAnnotations:bigmePollInterval()
+    return self.bigme_direct_ink and BIGME_DIRECT_INK_POLL_INTERVAL_S
+        or BIGME_POLL_INTERVAL_S
+end
+
+-- Queue a finished OEM-previewed stroke for KOReader's repaint. Like
+-- HandwritingManager, the normal surface is only committed once the pen has
+-- been idle, so quick consecutive strokes are not interrupted by refreshes.
+function StylusAnnotations:queueBigmeFinalize(region)
+    if region then
+        self.bigme_pending_region = Geometry.mergeRect(self.bigme_pending_region,
+            region.x, region.y, region.w, region.h)
+    end
+    if self.bigme_finalize_timer then
+        UIManager:unschedule(self.bigme_finalize_timer)
+    end
+    self.bigme_finalize_timer = function()
+        self.bigme_finalize_timer = nil
+        self:finalizeBigmeInk()
+    end
+    UIManager:scheduleIn(BIGME_FINALIZE_DELAY_S, self.bigme_finalize_timer)
+end
+
+function StylusAnnotations:cancelBigmeFinalizeTimer()
+    if self.bigme_finalize_timer then
+        UIManager:unschedule(self.bigme_finalize_timer)
+        self.bigme_finalize_timer = nil
+    end
+end
+
+-- Repaint pending strokes now. The strokes are already in the store, so the
+-- dialog repaint draws them; refreshRegion re-enables normal commits right
+-- before KOReader posts that repaint.
+function StylusAnnotations:finalizeBigmeInk()
+    self:cancelBigmeFinalizeTimer()
+    local region = self.bigme_pending_region
+    self.bigme_pending_region = nil
+    if region then
+        self:refreshRegion(region)
+    end
 end
 
 function StylusAnnotations:stopBigmeInput()
+    self:finalizeBigmeInk()
+    if self.bigme_restart_timer then
+        UIManager:unschedule(self.bigme_restart_timer)
+        self.bigme_restart_timer = nil
+    end
     if self.bigme_poll_timer then
         UIManager:unschedule(self.bigme_poll_timer)
         self.bigme_poll_timer = nil
     end
     self.pen_input:setBigmeActive(false)
+    self:stopBigmeScreenMirror()
     Bigme.close()
+    self.bigme_direct_ink = false
+    self.bigme_ink_style_key = nil
+end
+
+-- The framebuffer refresh implementations KOReader calls with the physical
+-- rect it posts to the panel (ffi/framebuffer_android.lua).
+local SCREEN_REFRESH_IMPS = {
+    "refreshFullImp", "refreshPartialImp", "refreshFlashPartialImp",
+    "refreshUIImp", "refreshFlashUIImp", "refreshFastImp",
+}
+
+-- A Bigme handwriting commit shows the service canvas as-is inside its rect,
+-- so the canvas must hold what the panel shows. Give the bridge KOReader's
+-- framebuffer and report every refreshed rect; it copies them between
+-- strokes. Without this, commit rects show white (or black) around the ink.
+function StylusAnnotations:startBigmeScreenMirror()
+    self:stopBigmeScreenMirror()
+    local bb = Screen.full_bb or Screen.bb
+    if not bb or bb:getType() ~= Blitbuffer.TYPE_BBRGB32 or bb:getRotation() ~= 0 then
+        logger.info("StylusAnnotations: Bigme screen mirror unsupported for this framebuffer")
+        return false
+    end
+    if not Bigme.setScreenBuffer(bb) then
+        logger.warn("StylusAnnotations: Bigme screen mirror unavailable")
+        return false
+    end
+    local saved = {}
+    for _, name in ipairs(SCREEN_REFRESH_IMPS) do
+        local original = Screen[name]
+        if original then
+            saved[name] = rawget(Screen, name) or false
+            Screen[name] = function(fb, x, y, w, h, ...)
+                local r1, r2, r3 = original(fb, x, y, w, h, ...)
+                pcall(function()
+                    local current = fb.full_bb or fb.bb
+                    if current ~= Bigme.screen_bb then
+                        -- Framebuffer reallocated (resize): hand over the new one.
+                        Bigme.setScreenBuffer(current)
+                    else
+                        Bigme.screenUpdated(x or 0, y or 0,
+                            w or current:getWidth(), h or current:getHeight(),
+                            current:getInverse() == 1)
+                    end
+                end)
+                return r1, r2, r3
+            end
+        end
+    end
+    self.bigme_mirror_hooks = saved
+    logger.info("StylusAnnotations: Bigme screen mirror enabled")
+    return true
+end
+
+function StylusAnnotations:stopBigmeScreenMirror()
+    local saved = self.bigme_mirror_hooks
+    if not saved then return end
+    for name, original in pairs(saved) do
+        rawset(Screen, name, original or nil)
+    end
+    self.bigme_mirror_hooks = nil
+end
+
+-- Bigme's canvas and view layout are bound to the window geometry; rebuild
+-- the client after rotation or resize, as HandwritingManager restarts on
+-- viewChanged.
+function StylusAnnotations:onSetDimensions()
+    if not self.bigme_poll_timer or self.bigme_restart_timer then return end
+    self.bigme_restart_timer = function()
+        self.bigme_restart_timer = nil
+        if self.current_stroke then self:endStroke() end
+        self:stopBigmeInput()
+        self:startBigmeInput()
+    end
+    UIManager:nextTick(self.bigme_restart_timer)
+end
+
+-- Page changes repaint the whole view; make sure it is not held back by the
+-- handwriting layer.
+function StylusAnnotations:onPageUpdate()
+    if self.bigme_direct_ink then self:finalizeBigmeInk() end
+end
+
+function StylusAnnotations:onPosUpdate()
+    if self.bigme_direct_ink then self:finalizeBigmeInk() end
 end
 
 function StylusAnnotations:onCloseDocument()
@@ -247,6 +506,13 @@ function StylusAnnotations:onCloseDocument()
     if self.eraser_refresh_timer then
         UIManager:unschedule(self.eraser_refresh_timer)
         self.eraser_refresh_timer = nil
+    end
+    -- The document view is going away; Bigme.close() restores normal commits.
+    self:cancelBigmeFinalizeTimer()
+    self.bigme_pending_region = nil
+    if self.pdf_sync_timer then
+        UIManager:unschedule(self.pdf_sync_timer)
+        self.pdf_sync_timer = nil
     end
     self:stopBigmeInput()
     if self.current_stroke then
@@ -378,6 +644,8 @@ end
 
 function StylusAnnotations:startStroke(x, y)
     self.stroke_id_counter = self.stroke_id_counter + 1
+    -- Keep writing without a normal refresh between strokes.
+    self:cancelBigmeFinalizeTimer()
     local stroke = {
         id = tostring(self.stroke_id_counter),
         width = self.width,
@@ -404,8 +672,12 @@ function StylusAnnotations:startStroke(x, y)
     }
 
     if self.live_mode ~= LIVE_MODE_DEFERRED then
-        self:takeLiveSnapshot()
-        if self.live_mode == LIVE_MODE_FAST then
+        local bigme_fast_preview = self.live_mode == LIVE_MODE_FAST
+            and self.pen_input and self.pen_input.bigme_active
+        if not bigme_fast_preview then
+            self:takeLiveSnapshot()
+        end
+        if self.live_mode == LIVE_MODE_FAST and not self.bigme_direct_ink then
             local sw = self:getStrokeScreenWidth(stroke)
             Draw.stampDisc(Screen.bb, x, y, sw / 2,
                 Draw.getRenderColor(stroke, self.ui.highlight))
@@ -414,12 +686,13 @@ function StylusAnnotations:startStroke(x, y)
 
     self.hold_start_x, self.hold_start_y = x, y
     self:scheduleHoldTimer()
+    return true
 end
 
 function StylusAnnotations:addStrokePoint(x, y)
     local stroke = self.current_stroke
-    if not stroke then return end
-    if not self.mapper:addPoint(stroke, x, y) then return end
+    if not stroke then return false end
+    if not self.mapper:addPoint(stroke, x, y) then return false end
 
     local sw = self:getStrokeScreenWidth(stroke)
     local pad = math.floor(sw / 2) + 1
@@ -427,7 +700,7 @@ function StylusAnnotations:addStrokePoint(x, y)
     local seg_y = math.min(self.pen_y, y) - pad
     local seg_w = math.abs(x - self.pen_x) + 2 * pad
     local seg_h = math.abs(y - self.pen_y) + 2 * pad
-    if self.live_mode == LIVE_MODE_FAST then
+    if self.live_mode == LIVE_MODE_FAST and not self.bigme_direct_ink then
         self:stampLiveSegment(stroke, x, y, sw,
             Draw.getRenderColor(stroke, self.ui.highlight))
     end
@@ -440,6 +713,7 @@ function StylusAnnotations:addStrokePoint(x, y)
             or math.abs(y - self.hold_start_y) > HOLD_MOVE_THRESHOLD_PX) then
         self:cancelHoldTimer()
     end
+    return true
 end
 
 function StylusAnnotations:stampLiveSegment(stroke, x, y, sw, color)
@@ -470,7 +744,28 @@ function StylusAnnotations:accumulateSegment(x, y, w, h)
     self.dirty_region = Geometry.mergeRect(self.dirty_region, x, y, w, h)
     if self.live_mode ~= LIVE_MODE_DEFERRED then
         self.live_dirty = Geometry.mergeRect(self.live_dirty, x, y, w, h)
+        if self.bigme_direct_ink and self.live_mode == LIVE_MODE_FAST then return end
+        if self.live_mode == LIVE_MODE_FAST and not self.live_snapshot then
+            self:flushFastIncremental()
+            return
+        end
         self:flushLiveThrottled()
+    end
+end
+
+function StylusAnnotations:flushFastIncremental()
+    local ld = self.live_dirty
+    if not ld or ld.w <= 0 or ld.h <= 0 then return end
+    local now = time.now()
+    if time.to_ms(now - self.last_refresh_time) < self:liveRefreshInterval() then return end
+    self.last_refresh_time = now
+    self.live_dirty = nil
+    local dx, dy, dw, dh = clampToScreen(ld.x, ld.y, ld.w, ld.h)
+    if dx then
+        UIManager:setDirty(nil, "fast", Geom:new{x = dx, y = dy, w = dw, h = dh})
+    end
+    if self.stroke_timing then
+        self.stroke_timing.flush_count = self.stroke_timing.flush_count + 1
     end
 end
 
@@ -505,7 +800,13 @@ function StylusAnnotations:onStrokeCancel()
     self.dirty_region = nil
     self.stroke_timing = nil
     self:cancelLive()
-    UIManager:setDirty(self.view.dialog, "partial")
+    self:cancelBigmeFinalizeTimer()
+    self.bigme_pending_region = nil
+    local direct_ink = self.bigme_direct_ink
+    UIManager:setDirty(self.view.dialog, function()
+        if direct_ink then Bigme.commitNormal() end
+        return "partial"
+    end)
 end
 
 function StylusAnnotations:endStroke()
@@ -529,7 +830,14 @@ function StylusAnnotations:endStroke()
         self:renderStrokeToScreen(stroke)
         self:refreshRegion(region)
     elseif self.live_mode == LIVE_MODE_FAST then
-        self:finalizeLiveStroke(stroke, region or self.live_dirty)
+        if self.bigme_direct_ink then
+            self:queueBigmeFinalize(region or self.live_dirty)
+        elseif self.live_snapshot then
+            self:finalizeLiveStroke(stroke, region or self.live_dirty)
+        else
+            self:renderStrokeToScreen(stroke)
+            self:refreshRegion(region or self.live_dirty)
+        end
     else
         local ld = self.live_dirty
         if ld and (ld.w > 0 or ld.h > 0) then
@@ -629,16 +937,26 @@ function StylusAnnotations:renderStrokeToScreen(stroke)
 end
 
 function StylusAnnotations:refreshRegion(region)
+    -- The callback runs after KOReader has repainted the dialog and right
+    -- before it posts the frame: re-enable Bigme's normal commits there, so
+    -- the handwriting layer is replaced by exactly this frame.
+    local direct_ink = self.bigme_direct_ink
+    local rx, ry, rw, rh
     if region then
-        local rx, ry, rw, rh = clampToScreen(region.x, region.y, region.w, region.h)
-        if rx then
-            UIManager:setDirty(self.view.dialog, function()
-                return "partial", Geom:new{x = rx, y = ry, w = rw, h = rh}
-            end)
-            return
-        end
+        rx, ry, rw, rh = clampToScreen(region.x, region.y, region.w, region.h)
     end
-    UIManager:setDirty(self.view.dialog, "partial")
+    if not rx then
+        rx, ry, rw, rh = 0, 0, Screen:getWidth(), Screen:getHeight()
+    end
+    local rect = Geom:new{x = rx, y = ry, w = rw, h = rh}
+    UIManager:setDirty(self.view.dialog, function()
+        if direct_ink and not Bigme.commitNormal() then
+            -- A new stroke started before this repaint was posted; the
+            -- panel keeps showing handwriting, so repaint again after it.
+            self:queueBigmeFinalize(rect)
+        end
+        return "partial", rect
+    end)
 end
 
 function StylusAnnotations:paintTo(bb, x, y)
@@ -981,7 +1299,7 @@ function StylusAnnotations:addToMainMenu(menu_items)
             {
                 text_func = function()
                     return self.bigme_poll_timer and _("Bigme input: on")
-                        or _("Try Bigme input (experimental)")
+                        or _("Bigme input: off (tap to connect)")
                 end,
                 callback = function()
                     if self.bigme_poll_timer then
@@ -1020,6 +1338,7 @@ end
 function StylusAnnotations:deleteStrokes(strokes, notify)
     local removed = self.store:remove(strokes)
     self:scheduleSave()
+    self:schedulePdfStylusSync(0)
     UIManager:setDirty(self.view.dialog, "partial")
     if notify ~= false then
         self:notifyStrokeDeleted(removed)
@@ -1040,6 +1359,8 @@ function StylusAnnotations:eraseStrokesAlong(x1, y1, x2, y2)
     if removed > 0 then
         self:scheduleSave()
         self:scheduleEraserRefresh()
+        -- Once the eraser pauses, drop the PDF copies of erased strokes.
+        self:schedulePdfStylusSync(0.3)
     end
     return removed
 end
@@ -1071,6 +1392,7 @@ function StylusAnnotations:confirmDeleteStrokes(text, count, remove)
         ok_callback = function()
             local removed = remove()
             self:scheduleSave()
+            self:schedulePdfStylusSync(0)
             UIManager:setDirty(self.view.dialog, "partial")
             self:notifyStrokeDeleted(removed)
         end,
@@ -1131,6 +1453,145 @@ function StylusAnnotations:saveStrokes()
         logger.warn("StylusAnnotations: failed to create sidecar dir:", err)
     end
     self.store:save(filepath)
+end
+
+-- With "Write highlights into PDF" on, this KOReader build copies our
+-- strokes into the PDF as ink annotations ("KOReaderStylus:...") on pause,
+-- suspend and close (ReaderHighlight:syncStylusAnnotationsToPdf). MuPDF draws
+-- those copies under our strokes, so deleting a stroke must also delete its
+-- copy, or it seems to stay. Let KOReader's own sync bring the in-memory PDF
+-- in line with our strokes; it only touches annotations that changed, and
+-- KOReader writes the file on pause/close as usual.
+function StylusAnnotations:syncPdfStylusCopies()
+    local doc = self.ui.document
+    local highlight = self.ui.highlight
+    if not (doc and doc.is_pdf and doc.syncStylusAnnotations
+        and highlight and highlight.highlight_write_into_pdf) then
+        return false
+    end
+    local was_edited = doc.is_edited
+    local ok, result = pcall(doc.syncStylusAnnotations, doc,
+        self.store.strokes, highlight, Screen.night_mode)
+    if not ok then
+        logger.warn("StylusAnnotations: could not sync PDF stroke copies:", result)
+        return false
+    end
+    if doc.is_edited and not was_edited then
+        logger.info("StylusAnnotations: removed PDF copies of deleted strokes")
+    end
+    return result == true
+end
+
+local function nearestColorName(rgb, highlight)
+    if not rgb then return "black" end
+    local best, best_d
+    for _, entry in ipairs(Draw.getColorPalette()) do
+        local name = entry[2]
+        local c = Draw.getPaletteColor(name, highlight):getColorRGB32()
+        local dr, dg, db = c.r - rgb.r, c.g - rgb.g, c.b - rgb.b
+        local d = dr * dr + dg * dg + db * db
+        if not best_d or d < best_d then
+            best, best_d = name, d
+        end
+    end
+    return best or "black"
+end
+
+-- Import ink annotations from the PDF as strokes: our own copies whose stroke
+-- is missing from the sidecar (e.g. written by another device, or left by a
+-- failed save) and ink written by other apps. Other apps' annotations are then
+-- deleted from the in-memory PDF; the next sync writes them back as our own
+-- copies, so they can be erased like any stroke. Only with "Write highlights
+-- into PDF" on: otherwise KOReader would never write them back and closing
+-- the book would drop them from the PDF.
+function StylusAnnotations:importPdfInkAnnotations()
+    local doc = self.ui.document
+    local highlight = self.ui.highlight
+    if not (self.ui.paging and doc and doc.is_pdf and doc.getInkAnnotations
+        and doc.deleteForeignInkAnnotations
+        and highlight and highlight.highlight_write_into_pdf) then
+        return 0
+    end
+    local ok, annotations = pcall(doc.getInkAnnotations, doc)
+    if not ok then
+        logger.warn("StylusAnnotations: could not read PDF ink annotations:", annotations)
+        return 0
+    end
+    if #annotations == 0 then return 0 end
+
+    -- Strokes are stored (and exported) at quarter-point precision; compare
+    -- at that precision so our own copies match their strokes exactly.
+    local function strokeKey(page, points)
+        local parts = { tostring(page) }
+        for i = 1, #points do
+            parts[#parts + 1] = tostring(Geometry.pack(points[i]))
+        end
+        return table.concat(parts, ",")
+    end
+    local known = {}
+    for _, stroke in ipairs(self.store.strokes) do
+        if stroke.page and stroke.points then
+            known[strokeKey(stroke.page, stroke.points)] = true
+        end
+    end
+
+    local zoom = self.view.state and self.view.state.zoom or 1
+    local now = os.time()
+    local imported, foreign = 0, 0
+    for _, annotation in ipairs(annotations) do
+        if not annotation.is_stylus then foreign = foreign + 1 end
+        local color = nearestColorName(annotation.color, highlight)
+        for _, vertices in ipairs(annotation.strokes) do
+            local points = {}
+            for _, p in ipairs(vertices) do
+                points[#points + 1] = Geometry.unpack(Geometry.pack(p.x))
+                points[#points + 1] = Geometry.unpack(Geometry.pack(p.y))
+            end
+            local key = strokeKey(annotation.page, points)
+            if #points >= 2 and not known[key] then
+                known[key] = true
+                imported = imported + 1
+                self.store:add({
+                    id = "pdf-" .. now .. "-" .. imported,
+                    page = annotation.page,
+                    points = points,
+                    width = annotation.width,
+                    color = color,
+                    alpha = annotation.opacity,
+                    zoom = zoom,
+                    datetime = now,
+                })
+            end
+        end
+    end
+    if imported > 0 then
+        self:scheduleSave()
+    end
+    if foreign > 0 then
+        local del_ok, err = pcall(doc.deleteForeignInkAnnotations, doc)
+        if not del_ok then
+            logger.warn("StylusAnnotations: could not replace other apps' ink:", err)
+        end
+    end
+    logger.info("StylusAnnotations: PDF ink annotations =", #annotations,
+        "imported strokes =", imported, "from other apps =", foreign)
+    return imported
+end
+
+-- delay: seconds to wait for further deletions (eraser), 0 = next tick.
+function StylusAnnotations:schedulePdfStylusSync(delay)
+    if self.pdf_sync_timer then
+        UIManager:unschedule(self.pdf_sync_timer)
+    end
+    self.pdf_sync_timer = function()
+        self.pdf_sync_timer = nil
+        if self:syncPdfStylusCopies() then
+            -- Only scheduled after deletions: re-render the page so the
+            -- removed copies disappear.
+            UIManager:setDirty(self.view.dialog, "partial")
+        end
+    end
+    UIManager:scheduleIn(delay or 0, self.pdf_sync_timer)
 end
 
 function StylusAnnotations:loadStrokes()

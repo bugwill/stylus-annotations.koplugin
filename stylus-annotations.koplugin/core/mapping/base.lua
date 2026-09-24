@@ -9,6 +9,13 @@ local SELECTION_WHITE = Blitbuffer.ColorRGB32(0xFF, 0xFF, 0xFF, 0xFF)
 
 local Mapping = {}
 
+-- Screen areas where initStroke/addPoint can anchor a stroke, as a list of
+-- {x, y, w, h}; nil means anywhere. Used to keep the Bigme OEM preview from
+-- showing ink that would not be stored.
+function Mapping:getWritableRects()
+    return nil
+end
+
 function Mapping:new(plugin)
     local o = {
         plugin = plugin,

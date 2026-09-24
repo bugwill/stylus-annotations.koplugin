@@ -1,0 +1,6 @@
+This plugin bundles classes from LSPosed/AndroidHiddenApiBypass 6.1.
+Copyright (C) 2021-2025 LSPosed. The classes are included in
+BigmeInputBridge.dex; the `stub/` type prefix was removed from references to
+Android runtime classes during DEX packaging.
+The bundled component is distributed under the Apache License 2.0. See
+LICENSE-HIDDEN-API-BYPASS.txt and https://github.com/LSPosed/AndroidHiddenApiBypass.

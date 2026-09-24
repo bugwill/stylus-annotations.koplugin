@@ -7,23 +7,46 @@ function Paged:new(plugin)
     return setmetatable(o, { __index = Paged })
 end
 
+-- Inverse of pageToScreenPoint: screen -> coordinates of a given visible
+-- page, also for points outside that page (page gaps, below the last page).
+-- Matches ReaderView:getSinglePagePosition/getScrollPagePosition inside it.
+function Paged:screenToPagePoint(page, x, y)
+    local state, visible_area, acc_y = self:pageState(page)
+    if not state then return nil end
+    local zoom = state.zoom or 1
+    return (x - state.offset.x + visible_area.x) / zoom,
+        (y - (acc_y or 0) - state.offset.y + visible_area.y) / zoom,
+        zoom
+end
+
 function Paged:initStroke(stroke, x, y)
     local pos = self.view:screenToPageTransform({ x = x, y = y })
-    if not pos then return false end
-    stroke.page = pos.page
-    stroke.zoom = pos.zoom or 1
-    stroke.points = { pos.x, pos.y }
+    local page = pos and pos.page
+    if not page then
+        -- Continuous mode below the last page: no page owns this point.
+        -- Anchor to the last visible page so blank space stays writable.
+        local states = self.view.page_scroll and self.view.page_states
+        local last = states and states[#states]
+        if not last then return false end
+        page = last.page
+    end
+    local px, py, zoom = self:screenToPagePoint(page, x, y)
+    if not px then return false end
+    stroke.page = page
+    stroke.zoom = zoom
+    stroke.points = { px, py }
     return true
 end
 
+-- Points stay relative to the stroke's own page, so a stroke may run past the
+-- page edge (into gaps, blank space or the next page) without being cut.
 function Paged:addPoint(stroke, x, y)
-    local pos = self.view:screenToPageTransform({ x = x, y = y })
-    if not pos then return false end
-    if pos.page ~= stroke.page then return end
+    local px, py = self:screenToPagePoint(stroke.page, x, y)
+    if not px then return false end
     local pts = stroke.points
     local m = #pts
-    if m >= 2 and pts[m - 1] == pos.x and pts[m] == pos.y then return end
-    pts[m + 1], pts[m + 2] = pos.x, pos.y
+    if m >= 2 and pts[m - 1] == px and pts[m] == py then return end
+    pts[m + 1], pts[m + 2] = px, py
     return true
 end
 

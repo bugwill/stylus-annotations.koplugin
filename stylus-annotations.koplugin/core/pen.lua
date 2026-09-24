@@ -302,11 +302,15 @@ function PenInput:onBigmeEvent(event_type, x, y, pressure, tool_type)
     self:resetEraserState()
     self.pen_lift_pending = false
     self.pen_active = true
-    if event_type == ACTION_DOWN or not plugin.current_stroke then
+    if event_type == ACTION_DOWN then
         plugin:startStroke(x, y)
-    else
+    elseif plugin.current_stroke then
         plugin:addStrokePoint(x, y)
+    elseif not plugin.bigme_direct_ink then
+        plugin:startStroke(x, y)
     end
+    -- With the OEM preview a stroke only starts on pen-down: the bridge locks
+    -- the preview to the writable area of the down point, like Base.apk.
 end
 
 function PenInput:onEraserEvent(x, y, id)

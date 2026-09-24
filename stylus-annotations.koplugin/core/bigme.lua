@@ -231,7 +231,7 @@ function Bigme.start()
         return false, "KOReader Android JNI bridge unavailable"
     end
     local activity = android.app.activity
-    local start_ok, started, global_bridge, result3, result4 = pcall(function()
+    local start_ok, started, global_bridge, result3, result4, result5 = pcall(function()
         return android.jni:context(activity.vm, function(jni)
             trace("JNI context entered")
             trace("getting Activity class")
@@ -326,6 +326,10 @@ function Bigme.start()
                     or "Bigme bridge did not start"
             end
 
+            local direct_ink = jni:callBooleanMethod(
+                bridge, "isDirectInkAvailable", "()Z")
+            local direct_ink_failed = clearException(jni)
+
             local global_ref = jni.env[0].NewGlobalRef(jni.env, bridge)
             jni.env[0].DeleteLocalRef(jni.env, bridge)
             jni.env[0].DeleteLocalRef(jni.env, bridge_class)
@@ -336,14 +340,15 @@ function Bigme.start()
             local width, height = response_text:match("^OK,(%d+),(%d+)$")
             -- Do not place nil between multiple callback return values: the JNI
             -- context wrapper truncates the values after that nil on this port.
-            return true, global_ref, tonumber(width), tonumber(height)
+            return true, global_ref, tonumber(width), tonumber(height),
+                direct_ink and not direct_ink_failed
         end)
     end)
 
     local failure
-    local width, height
+    local width, height, direct_ink
     if started then
-        width, height = result3, result4
+        width, height, direct_ink = result3, result4, result5
     else
         failure = result3
     end
@@ -356,6 +361,7 @@ function Bigme.start()
     Bigme.bridge = global_bridge
     Bigme.width = tonumber(width)
     Bigme.height = tonumber(height)
+    Bigme.direct_ink = direct_ink == true
     if not Bigme.width or not Bigme.height then
         Bigme.width, Bigme.height = nil, nil
     end
@@ -363,24 +369,155 @@ function Bigme.start()
     return true, Bigme.width, Bigme.height
 end
 
-function Bigme.drain()
-    if not Bigme.bridge then return nil end
+function Bigme.hasDirectInk()
+    return Bigme.direct_ink == true
+end
+
+function Bigme.setDirectInkStyle(enabled, width, argb)
+    if not Bigme.bridge or not Bigme.hasDirectInk() then return false end
     local ok, android = pcall(require, "android")
     if not ok or not android or not android.jni or not android.app or not android.app.activity then
-        return nil
+        return false
     end
-    local success, batch = pcall(function()
+    local state = enabled and "1" or "0"
+    local config = string.format("%s,%.3f,%s", state,
+        math.max(1, tonumber(width) or 1), argb or "FFFF9500")
+    local success, configured = pcall(function()
+        return android.jni:context(android.app.activity.vm, function(jni)
+            local text = jni.env[0].NewStringUTF(jni.env, config)
+            if text == nil or clearException(jni) then return false end
+            local result = jni:callBooleanMethod(Bigme.bridge, "setDirectInkStyle",
+                "(Ljava/lang/String;)Z", text)
+            jni.env[0].DeleteLocalRef(jni.env, text)
+            if clearException(jni) then return false end
+            return result
+        end)
+    end)
+    return success and configured or false
+end
+
+-- Hand KOReader's RGBA32 framebuffer to the bridge as a direct ByteBuffer
+-- (no copy). The bridge mirrors it into the handwriting canvas, because a
+-- handwriting commit shows that canvas as-is inside the commit rect.
+function Bigme.setScreenBuffer(bb)
+    if not Bigme.bridge or not Bigme.hasDirectInk() or not bb then return false end
+    local ok, android = pcall(require, "android")
+    if not ok or not android or not android.jni or not android.app or not android.app.activity then
+        return false
+    end
+    local ffi = require("ffi")
+    local geometry = string.format("%d,%d,%d,%d", tonumber(bb.stride),
+        bb:getWidth(), bb:getHeight(), bb:getInverse() == 1 and 1 or 0)
+    local success, enabled = pcall(function()
+        return android.jni:context(android.app.activity.vm, function(jni)
+            local buffer = jni.env[0].NewDirectByteBuffer(jni.env,
+                ffi.cast("void*", bb.data), tonumber(bb.stride) * bb:getHeight())
+            if buffer == nil or clearException(jni) then return false end
+            local text = jni.env[0].NewStringUTF(jni.env, geometry)
+            if text == nil or clearException(jni) then
+                jni.env[0].DeleteLocalRef(jni.env, buffer)
+                return false
+            end
+            local result = jni:callBooleanMethod(Bigme.bridge, "setScreenBuffer",
+                "(Ljava/nio/ByteBuffer;Ljava/lang/String;)Z", buffer, text)
+            jni.env[0].DeleteLocalRef(jni.env, text)
+            jni.env[0].DeleteLocalRef(jni.env, buffer)
+            if clearException(jni) then return false end
+            return result
+        end)
+    end)
+    if success and enabled then
+        -- The bridge reads this memory later; keep the buffer alive.
+        Bigme.screen_bb = bb
+        return true
+    end
+    Bigme.screen_bb = nil
+    return false
+end
+
+-- KOReader posted (x, y, w, h) of its framebuffer to the panel.
+function Bigme.screenUpdated(x, y, w, h, inverse)
+    if not Bigme.bridge or not Bigme.screen_bb then return end
+    local ok, android = pcall(require, "android")
+    if not ok or not android or not android.jni or not android.app or not android.app.activity then
+        return
+    end
+    local spec = string.format("%d,%d,%d,%d,%d", x, y, w, h, inverse and 1 or 0)
+    pcall(function()
+        android.jni:context(android.app.activity.vm, function(jni)
+            local text = jni.env[0].NewStringUTF(jni.env, spec)
+            if text == nil or clearException(jni) then return end
+            jni:callVoidMethod(Bigme.bridge, "screenUpdated", "(Ljava/lang/String;)V", text)
+            jni.env[0].DeleteLocalRef(jni.env, text)
+            clearException(jni)
+        end)
+    end)
+end
+
+-- spec: "left,top,right,bottom;..." in Bigme view coordinates, "" = anywhere.
+function Bigme.setWritableRects(spec)
+    if not Bigme.bridge or not Bigme.hasDirectInk() then return false end
+    local ok, android = pcall(require, "android")
+    if not ok or not android or not android.jni or not android.app or not android.app.activity then
+        return false
+    end
+    local success, configured = pcall(function()
+        return android.jni:context(android.app.activity.vm, function(jni)
+            local text = jni.env[0].NewStringUTF(jni.env, spec or "")
+            if text == nil or clearException(jni) then return false end
+            local result = jni:callBooleanMethod(Bigme.bridge, "setWritableRects",
+                "(Ljava/lang/String;)Z", text)
+            jni.env[0].DeleteLocalRef(jni.env, text)
+            if clearException(jni) then return false end
+            return result
+        end)
+    end)
+    return success and configured or false
+end
+
+-- Re-enable Bigme's normal surface commits right before KOReader posts the
+-- repaint that contains finished strokes (Base.apk's onUpdateViewContent).
+-- Returns false only while the bridge is still drawing a stroke; the caller
+-- should retry after it (normal commits stay suspended meanwhile). Without a
+-- bridge there is nothing to wait for, so that counts as committed.
+function Bigme.commitNormal()
+    if not Bigme.bridge or not Bigme.hasDirectInk() then return true end
+    local ok, android = pcall(require, "android")
+    if not ok or not android or not android.jni or not android.app or not android.app.activity then
+        return true
+    end
+    local success, committed = pcall(function()
+        return android.jni:context(android.app.activity.vm, function(jni)
+            local result = jni:callBooleanMethod(Bigme.bridge, "commitNormal", "()Z")
+            if clearException(jni) then return true end
+            return result
+        end)
+    end)
+    if not success then return true end
+    return committed ~= false
+end
+
+function Bigme.drain()
+    if not Bigme.bridge then return nil, false end
+    local ok, android = pcall(require, "android")
+    if not ok or not android or not android.jni or not android.app or not android.app.activity then
+        return nil, false
+    end
+    local success, batch, direct_ink_available = pcall(function()
         return android.jni:context(android.app.activity.vm, function(jni)
             local response = jni:callObjectMethod(
                 Bigme.bridge, "drain", "()Ljava/lang/String;")
             local result = response and jni:to_string(response) or ""
             if response ~= nil then jni.env[0].DeleteLocalRef(jni.env, response) end
-            clearException(jni)
-            return result
+            if clearException(jni) then return result, false end
+            local available = jni:callBooleanMethod(
+                Bigme.bridge, "isDirectInkAvailable", "()Z")
+            if clearException(jni) then return result, false end
+            return result, available
         end)
     end)
-    if not success then return nil end
-    return batch
+    if not success then return nil, false end
+    return batch, direct_ink_available
 end
 
 function Bigme.close()
@@ -396,6 +533,8 @@ function Bigme.close()
         end)
     end
     Bigme.bridge = nil
+    Bigme.screen_bb = nil
+    Bigme.direct_ink = false
     Bigme.width, Bigme.height = nil, nil
 end
 
