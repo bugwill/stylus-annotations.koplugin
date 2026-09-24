@@ -341,7 +341,7 @@ file`). The KOReader build saves PDF annotations on every trip to the
 background (`ReaderHighlight:savePdfAnnotationsOnBackground`), so two
 background trips per session were enough.
 
-Fix in `/Documents/Coding/koreader/frontend/document/pdfdocument.lua`
+Fix in KOReader's `frontend/document/pdfdocument.lua`
 (`PdfDocument:writeDocument`): the first save of an opened document stays
 incremental; later saves, and saves after a failed incremental write, write
 the whole PDF to `<file>.koreader-tmp` and `os.rename` it over the original
