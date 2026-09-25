@@ -31,6 +31,7 @@ function PenInput:new(plugin)
         bigme_height = nil,
         bigme_logged_pen = false,
         bigme_eraser_removed = 0,
+        pen_tap_handled = false,
     }
     return setmetatable(o, { __index = PenInput })
 end
@@ -189,7 +190,9 @@ function PenInput:onStylusEvent(input, slot)
         if self.pen_active then
             if not (slot.id and slot.id >= 0) then
                 self.pen_active = false
+                self.pen_tap_handled = false
                 plugin:endPenSelection()
+                plugin:endPenContactIgnored()
             end
             return true
         end
@@ -209,20 +212,32 @@ function PenInput:onStylusEvent(input, slot)
         self.pen_lift_pending = false
         self.pen_active = true
 
-        if plugin.pen_selecting then
+        if self.pen_tap_handled then
+            -- This contact already opened a highlight menu: ignore the rest.
+        elseif plugin.pen_selecting then
             plugin:penSelectionMove(x, y)
         elseif plugin.current_stroke then
             plugin:addStrokePoint(x, y)
         else
             self.pen_lift_x = x
             self.pen_lift_y = y
-            plugin:startStroke(x, y)
+            if plugin:penTapHighlight(x, y) then
+                self.pen_tap_handled = true
+            else
+                plugin:startStroke(x, y)
+            end
         end
         ret = true
     else
         local was_active = self.pen_active
         self.pen_active = false
-        if plugin.pen_selecting or plugin.current_stroke then
+        if self.pen_tap_handled then
+            self.pen_tap_handled = false
+            plugin:endPenContactIgnored()
+            if was_active then
+                self.pen_lift_pending = true
+            end
+        elseif plugin.pen_selecting or plugin.current_stroke then
             if plugin.pen_selecting then
                 plugin:endPenSelection()
             else
@@ -262,7 +277,14 @@ function PenInput:onBigmeEvent(event_type, x, y, pressure, tool_type)
         elseif self.bigme_pointer_tool == TOOL_PEN then
             local was_active = self.pen_active
             self.pen_active = false
-            if plugin.pen_selecting or plugin.current_stroke then
+            if self.pen_tap_handled then
+                self.pen_tap_handled = false
+                plugin:endPenContactIgnored()
+                if was_active then
+                    self.pen_lift_x, self.pen_lift_y = x, y
+                    self.pen_lift_pending = true
+                end
+            elseif plugin.pen_selecting or plugin.current_stroke then
                 if plugin.pen_selecting then
                     plugin:endPenSelection()
                 else
@@ -315,8 +337,16 @@ function PenInput:onBigmeEvent(event_type, x, y, pressure, tool_type)
     self.pen_active = true
     if event_type == ACTION_DOWN then
         -- A lost pen-up must not leave a selection running into this contact.
+        self.pen_tap_handled = false
         plugin:endPenSelection()
-        plugin:startStroke(x, y)
+        plugin:endPenContactIgnored()
+        if plugin:penTapHighlight(x, y) then
+            self.pen_tap_handled = true
+        else
+            plugin:startStroke(x, y)
+        end
+    elseif self.pen_tap_handled then
+        return
     elseif plugin.pen_selecting then
         plugin:penSelectionMove(x, y)
     elseif plugin.current_stroke then
