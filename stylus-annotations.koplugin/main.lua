@@ -150,6 +150,7 @@ local StylusAnnotations = InputContainer:extend{
     hold_start_y = 0,
 
     pen_selecting = false,
+    pen_contact_ignored = false,
     pen_select_pos = nil,
     pen_select_pan_time = nil,
 
@@ -251,7 +252,7 @@ function StylusAnnotations:syncBigmeInkStyle(force)
     width = width * sx
     local enabled = self.live_mode == LIVE_MODE_FAST
         and self:isEnabled() and not self:isOverlayActive()
-        and not self.pen_selecting
+        and not self.pen_selecting and not self.pen_contact_ignored
     local key = table.concat({ enabled and "1" or "0", string.format("%.3f", width), argb }, ",")
     if force or key ~= self.bigme_ink_style_key then
         if not Bigme.setDirectInkStyle(enabled, width, argb) then
@@ -514,6 +515,7 @@ function StylusAnnotations:onCloseDocument()
     end
     self:cancelHoldTimer()
     self.pen_selecting = false
+    self.pen_contact_ignored = false
     self.pen_select_pos = nil
     if self.bigme_start_timer then
         UIManager:unschedule(self.bigme_start_timer)
@@ -566,6 +568,10 @@ end
 
 function StylusAnnotations:isPenSelectEnabled()
     return G_reader_settings:readSetting("stylus_annotations_pen_select") ~= false
+end
+
+function StylusAnnotations:isPenTapHighlightEnabled()
+    return G_reader_settings:readSetting("stylus_annotations_pen_tap_highlight") ~= false
 end
 
 function StylusAnnotations:loadSettings()
@@ -820,6 +826,39 @@ function StylusAnnotations:onStrokeHoldTimer()
     if held then
         self:showStrokeMenu({ held })
     end
+end
+
+-- A pen-down on an existing highlight opens its menu at once, exactly like a
+-- finger tap (ReaderHighlight:onTap), instead of starting a stroke. Returns
+-- true when the contact was taken: the caller then ignores the rest of it.
+function StylusAnnotations:penTapHighlight(x, y)
+    if not self:isPenTapHighlightEnabled() then return false end
+    local highlight = self.ui.highlight
+    if not highlight or #self.view.highlight.visible_boxes == 0 then return false end
+    -- Stop the OEM ink first: it starts drawing before Lua sees the pen-down.
+    self.pen_contact_ignored = true
+    self:syncBigmeInkStyle()
+    local ok, handled = pcall(highlight.onTap, highlight, nil, self:penSelectionGesture(x, y))
+    if not ok then
+        logger.err("StylusAnnotations: pen tap on highlight failed:", handled)
+    end
+    if ok and handled then
+        local direct_ink = self.bigme_direct_ink
+        UIManager:setDirty(self.view.dialog, function()
+            if direct_ink then Bigme.commitNormal() end
+            return "partial"
+        end)
+        return true
+    end
+    self.pen_contact_ignored = false
+    self:syncBigmeInkStyle()
+    return false
+end
+
+function StylusAnnotations:endPenContactIgnored()
+    if not self.pen_contact_ignored then return end
+    self.pen_contact_ignored = false
+    self:syncBigmeInkStyle()
 end
 
 -- Holding the pen still turns the rest of that contact into a text selection,
@@ -1366,6 +1405,16 @@ function StylusAnnotations:addToMainMenu(menu_items)
                 callback = function()
                     G_reader_settings:saveSetting("stylus_annotations_pen_select",
                         not self:isPenSelectEnabled())
+                end,
+            },
+            {
+                text = _("Pen tap on a highlight opens its menu"),
+                checked_func = function()
+                    return self:isPenTapHighlightEnabled()
+                end,
+                callback = function()
+                    G_reader_settings:saveSetting("stylus_annotations_pen_tap_highlight",
+                        not self:isPenTapHighlightEnabled())
                 end,
             },
             {
