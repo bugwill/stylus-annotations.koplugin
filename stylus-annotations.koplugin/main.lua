@@ -822,11 +822,9 @@ function StylusAnnotations:onStrokeHoldTimer()
     end
 end
 
--- Holding the pen still hands the contact over to ReaderHighlight, like a
--- finger long-press does (its touch zones never see the pen's events): on an
--- existing highlight it opens the highlight menu (its tap handler), anywhere
--- else it turns the rest of the contact into a text selection (its hold,
--- hold_pan and hold_release handlers).
+-- Holding the pen still turns the rest of that contact into a text selection,
+-- like a finger long-press: the pen drives ReaderHighlight's hold, hold_pan
+-- and hold_release handlers (its touch zones never see the pen's events).
 function StylusAnnotations:penSelectionGesture(x, y)
     return {
         ges = "hold",
@@ -843,17 +841,6 @@ function StylusAnnotations:startPenSelection(x, y)
     self:syncBigmeInkStyle()
     self:onStrokeCancel()
     local ok, handled = false, false
-    if highlight and #self.view.highlight.visible_boxes > 0 then
-        ok, handled = pcall(highlight.onTap, highlight, nil, self:penSelectionGesture(x, y))
-        if not ok then
-            logger.err("StylusAnnotations: pen hold on highlight failed:", handled)
-        elseif handled then
-            self.pen_selecting = false
-            self:syncBigmeInkStyle()
-            return true
-        end
-        ok, handled = false, false
-    end
     if highlight then
         ok, handled = pcall(highlight.onHold, highlight, nil, self:penSelectionGesture(x, y))
         if not ok then
@@ -1372,7 +1359,7 @@ function StylusAnnotations:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = _("Hold pen still to select text or edit highlight"),
+                text = _("Hold pen still to select text"),
                 checked_func = function()
                     return self:isPenSelectEnabled()
                 end,
