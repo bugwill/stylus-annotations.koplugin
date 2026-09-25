@@ -71,6 +71,8 @@ local BIGME_FINALIZE_DELAY_S = 0.15
 local BIGME_POLL_INTERVAL_S = 0.008
 local BIGME_DIRECT_INK_POLL_INTERVAL_S = 0.016
 local DEFAULT_HOLD_INTERVAL_MS = 500
+local DEFAULT_HOLD_PAN_RATE = 30
+local LOW_HOLD_PAN_RATE = 5
 
 local MIN_STROKE_WIDTH = 1
 local MAX_STROKE_WIDTH = 30
@@ -86,6 +88,13 @@ local FULL_SCREEN_ZONE = {
 local function holdIntervalSeconds()
     local ms = G_reader_settings:readSetting("ges_hold_interval_ms") or DEFAULT_HOLD_INTERVAL_MS
     return ms / 1000
+end
+
+-- Same pan rate KOReader uses for finger text selection.
+local function holdPanIntervalSeconds()
+    local rate = G_reader_settings:readSetting("hold_pan_rate")
+        or (Screen.low_pan_rate and LOW_HOLD_PAN_RATE or DEFAULT_HOLD_PAN_RATE)
+    return 1 / rate
 end
 
 local function clampToScreen(x, y, w, h)
@@ -139,6 +148,10 @@ local StylusAnnotations = InputContainer:extend{
     hold_timer = nil,
     hold_start_x = 0,
     hold_start_y = 0,
+
+    pen_selecting = false,
+    pen_select_pos = nil,
+    pen_select_pan_time = nil,
 
     selected_strokes = {},
     selection_backup = nil,
@@ -238,6 +251,7 @@ function StylusAnnotations:syncBigmeInkStyle(force)
     width = width * sx
     local enabled = self.live_mode == LIVE_MODE_FAST
         and self:isEnabled() and not self:isOverlayActive()
+        and not self.pen_selecting
     local key = table.concat({ enabled and "1" or "0", string.format("%.3f", width), argb }, ",")
     if force or key ~= self.bigme_ink_style_key then
         if not Bigme.setDirectInkStyle(enabled, width, argb) then
@@ -499,6 +513,8 @@ function StylusAnnotations:onCloseDocument()
         self.pending_save = nil
     end
     self:cancelHoldTimer()
+    self.pen_selecting = false
+    self.pen_select_pos = nil
     if self.bigme_start_timer then
         UIManager:unschedule(self.bigme_start_timer)
         self.bigme_start_timer = nil
@@ -546,6 +562,10 @@ function StylusAnnotations:updateLiveMode(enabled)
     else
         self.live_mode = LIVE_MODE_DEFERRED
     end
+end
+
+function StylusAnnotations:isPenSelectEnabled()
+    return G_reader_settings:readSetting("stylus_annotations_pen_select") ~= false
 end
 
 function StylusAnnotations:loadSettings()
@@ -791,8 +811,87 @@ function StylusAnnotations:onStrokeHoldTimer()
     local dx = self.pen_x - self.hold_start_x
     local dy = self.pen_y - self.hold_start_y
     if dx * dx + dy * dy > HOLD_MOVE_THRESHOLD_PX * HOLD_MOVE_THRESHOLD_PX then return end
+    local held = self.store:findStrokeAt(self.hold_start_x, self.hold_start_y)
+    if not held and self:isPenSelectEnabled() then
+        self:startPenSelection(self.pen_x, self.pen_y)
+        return
+    end
     self:onStrokeCancel()
-    self:showStrokeMenuAt(self.hold_start_x, self.hold_start_y)
+    if held then
+        self:showStrokeMenu({ held })
+    end
+end
+
+-- Holding the pen still turns the rest of that contact into a text selection,
+-- like a finger long-press: the pen drives ReaderHighlight's hold, hold_pan
+-- and hold_release handlers (its touch zones never see the pen's events).
+function StylusAnnotations:penSelectionGesture(x, y)
+    return {
+        ges = "hold",
+        pos = Geom:new{ x = x, y = y, w = 0, h = 0 },
+        time = time.realtime(),
+    }
+end
+
+function StylusAnnotations:startPenSelection(x, y)
+    local highlight = self.ui.highlight
+    -- Stop the OEM ink before the stroke is dropped, so the bridge does not
+    -- draw the rest of this contact.
+    self.pen_selecting = true
+    self:syncBigmeInkStyle()
+    self:onStrokeCancel()
+    local ok, handled = false, false
+    if highlight then
+        ok, handled = pcall(highlight.onHold, highlight, nil, self:penSelectionGesture(x, y))
+        if not ok then
+            logger.err("StylusAnnotations: pen selection failed to start:", handled)
+        end
+    end
+    if not (ok and handled and highlight.hold_pos) then
+        -- No text under the pen (or something else took the hold, e.g. an
+        -- image viewer): the contact just continues as ordinary writing.
+        self.pen_selecting = false
+        self:syncBigmeInkStyle()
+        return false
+    end
+    self.pen_select_pos = nil
+    self.pen_select_pan_time = time.now()
+    return true
+end
+
+function StylusAnnotations:flushPenSelectionPan()
+    local pos = self.pen_select_pos
+    if not pos then return end
+    self.pen_select_pos = nil
+    self.pen_select_pan_time = time.now()
+    local highlight = self.ui.highlight
+    local ok, err = pcall(highlight.onHoldPan, highlight, nil,
+        self:penSelectionGesture(pos.x, pos.y))
+    if not ok then
+        logger.err("StylusAnnotations: pen selection pan failed:", err)
+    end
+end
+
+function StylusAnnotations:penSelectionMove(x, y)
+    if not self.pen_selecting then return end
+    self.pen_select_pos = { x = x, y = y }
+    local elapsed = time.to_s(time.now() - self.pen_select_pan_time)
+    if elapsed >= holdPanIntervalSeconds() then
+        self:flushPenSelectionPan()
+    end
+end
+
+function StylusAnnotations:endPenSelection()
+    if not self.pen_selecting then return end
+    self:flushPenSelectionPan()
+    self.pen_selecting = false
+    self.pen_select_pos = nil
+    self:syncBigmeInkStyle()
+    local highlight = self.ui.highlight
+    local ok, err = pcall(highlight.onHoldRelease, highlight)
+    if not ok then
+        logger.err("StylusAnnotations: pen selection release failed:", err)
+    end
 end
 
 function StylusAnnotations:onStrokeCancel()
@@ -1098,12 +1197,6 @@ function StylusAnnotations:closeStrokeDialog(dialog, action)
     action()
 end
 
-function StylusAnnotations:showStrokeMenuAt(x, y)
-    local stroke = self.store:findStrokeAt(x, y)
-    if not stroke then return end
-    self:showStrokeMenu({ stroke })
-end
-
 function StylusAnnotations:showColorPicker(current, apply)
 
     local values = {}
@@ -1263,6 +1356,16 @@ function StylusAnnotations:addToMainMenu(menu_items)
                 end,
                 callback = function()
                     self:onStylusAnnotationsToggle()
+                end,
+            },
+            {
+                text = _("Hold pen still to select text"),
+                checked_func = function()
+                    return self:isPenSelectEnabled()
+                end,
+                callback = function()
+                    G_reader_settings:saveSetting("stylus_annotations_pen_select",
+                        not self:isPenSelectEnabled())
                 end,
             },
             {

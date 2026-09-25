@@ -189,6 +189,7 @@ function PenInput:onStylusEvent(input, slot)
         if self.pen_active then
             if not (slot.id and slot.id >= 0) then
                 self.pen_active = false
+                plugin:endPenSelection()
             end
             return true
         end
@@ -208,7 +209,9 @@ function PenInput:onStylusEvent(input, slot)
         self.pen_lift_pending = false
         self.pen_active = true
 
-        if plugin.current_stroke then
+        if plugin.pen_selecting then
+            plugin:penSelectionMove(x, y)
+        elseif plugin.current_stroke then
             plugin:addStrokePoint(x, y)
         else
             self.pen_lift_x = x
@@ -219,8 +222,12 @@ function PenInput:onStylusEvent(input, slot)
     else
         local was_active = self.pen_active
         self.pen_active = false
-        if plugin.current_stroke then
-            plugin:endStroke()
+        if plugin.pen_selecting or plugin.current_stroke then
+            if plugin.pen_selecting then
+                plugin:endPenSelection()
+            else
+                plugin:endStroke()
+            end
             if was_active then
                 self.pen_lift_pending = true
             end
@@ -255,8 +262,12 @@ function PenInput:onBigmeEvent(event_type, x, y, pressure, tool_type)
         elseif self.bigme_pointer_tool == TOOL_PEN then
             local was_active = self.pen_active
             self.pen_active = false
-            if plugin.current_stroke then
-                plugin:endStroke()
+            if plugin.pen_selecting or plugin.current_stroke then
+                if plugin.pen_selecting then
+                    plugin:endPenSelection()
+                else
+                    plugin:endStroke()
+                end
                 if was_active then
                     self.pen_lift_x, self.pen_lift_y = x, y
                     self.pen_lift_pending = true
@@ -303,7 +314,11 @@ function PenInput:onBigmeEvent(event_type, x, y, pressure, tool_type)
     self.pen_lift_pending = false
     self.pen_active = true
     if event_type == ACTION_DOWN then
+        -- A lost pen-up must not leave a selection running into this contact.
+        plugin:endPenSelection()
         plugin:startStroke(x, y)
+    elseif plugin.pen_selecting then
+        plugin:penSelectionMove(x, y)
     elseif plugin.current_stroke then
         plugin:addStrokePoint(x, y)
     elseif not plugin.bigme_direct_ink then
