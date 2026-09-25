@@ -153,6 +153,8 @@ local StylusAnnotations = InputContainer:extend{
     pen_contact_ignored = false,
     pen_select_pos = nil,
     pen_select_pan_time = nil,
+    pen_select_origin = nil,
+    pen_select_dragged = false,
 
     selected_strokes = {},
     selection_backup = nil,
@@ -895,6 +897,8 @@ function StylusAnnotations:startPenSelection(x, y)
     end
     self.pen_select_pos = nil
     self.pen_select_pan_time = time.now()
+    self.pen_select_origin = { x = x, y = y }
+    self.pen_select_dragged = false
     return true
 end
 
@@ -913,6 +917,17 @@ end
 
 function StylusAnnotations:penSelectionMove(x, y)
     if not self.pen_selecting then return end
+    if not self.pen_select_dragged then
+        -- A resting pen jitters. ReaderHighlight turns a single-word selection
+        -- (dictionary lookup on release) into a multi-word one on any pan, so
+        -- only pass on movement once the pen has clearly been dragged.
+        local origin = self.pen_select_origin
+        if math.abs(x - origin.x) <= HOLD_MOVE_THRESHOLD_PX
+            and math.abs(y - origin.y) <= HOLD_MOVE_THRESHOLD_PX then
+            return
+        end
+        self.pen_select_dragged = true
+    end
     self.pen_select_pos = { x = x, y = y }
     local elapsed = time.to_s(time.now() - self.pen_select_pan_time)
     if elapsed >= holdPanIntervalSeconds() then
